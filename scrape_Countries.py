@@ -123,6 +123,79 @@ def _img_src(img_el) -> str:
             return v.strip()
     return ""
 
+# --- Hotels listing helpers ---
+
+HOTELS_IN_RE = re.compile(r"\bhotels\s+in\b", re.I)
+
+def resolve_hotels_listing_url(html: str, base_url: str) -> str:
+    """
+    If there is an <a> that contains a <span> whose text includes 'hotels in',
+    follow that link. Otherwise return the current page.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # Prefer span inside anchor
+    for span in soup.select("a span"):
+        txt = (span.get_text(strip=True) or "")
+        if HOTELS_IN_RE.search(txt):
+            a = span.find_parent("a", href=True)
+            if a and a["href"]:
+                return urljoin(BASE_URL, a["href"])
+
+    # Fallback: anchor's own text
+    for a in soup.find_all("a", href=True):
+        txt = (a.get_text(strip=True) or "")
+        if HOTELS_IN_RE.search(txt):
+            return urljoin(BASE_URL, a["href"])
+
+    return base_url
+
+
+def parse_hotels_from_listing(html: str, base_url: str) -> List[Dict[str, str]]:
+    """
+    Parse Booking search results. Cards are usually data-testid=property-card.
+    We extract hotel name and absolute URL.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    hotels: List[Dict[str, str]] = []
+    cards = soup.select("[data-testid='property-card']")
+
+    for card in cards:
+        # 1) Title link — handle both variants
+        #    a) <a data-testid="title-link" ...>
+        #    b) <h3><a ...></a></h3>  or sometimes h2
+        a = card.select_one("a[data-testid='title-link'][href], h3 a[href], h2 a[href]")
+        if not a:
+            continue
+
+        href = a.get("href", "").strip()
+        if not href:
+            continue
+        url = urljoin(base_url, href)
+
+        # 2) Name — prefer data-testid title node, else use the anchor text
+        name_el = card.select_one("[data-testid='title']") or a
+        name = name_el.get_text(strip=True) if name_el else ""
+        if not name:
+            continue
+
+        # 3) Append and dedupe outside this loop if you already do that
+        hotels.append({"name": name, "url": url})
+
+    return hotels
+
+
+def scrape_city_hotels(s: requests.Session, city_url: str) -> List[Dict[str, str]]:
+    """
+    Resolve final listing URL per the 'hotels in' rule, then parse hotels.
+    """
+    html = get_html(s, city_url)
+    target = resolve_hotels_listing_url(html, city_url)
+    if target != city_url:
+        html = get_html(s, target)
+    return parse_hotels_from_listing(html, target)
+
+
 # ---------- Parsers ----------
 
 def parse_country_from_breadcrumb(html: str, page_url: str) -> Tuple[str, str]:
@@ -311,10 +384,37 @@ def resolve_country_worker(s: requests.Session, region: Dict) -> Optional[Tuple[
 
 
 def scrape_country_worker(s: requests.Session, country: Dict[str, str]) -> Tuple[str, Dict]:
-    html = get_html(s, country["url"])
+    url = country["url"]
+    html = get_html(s, url)
+
+    # Parse cities and popular regions as before
     cities = parse_cities_from_country(html)
     popular_regions = parse_popular_regions(html)
-    return country["url"], {"cities": cities, "popular_regions": popular_regions}
+
+    # For each city, fetch hotels concurrently
+    updated_cities: List[Dict[str, str]] = []
+    if cities:
+        # Pool size proportional to number of cities — go hard but bounded by cities count
+        poolsize = max(1, min(len(cities), 128))
+        def job(city: Dict[str, str]) -> Dict[str, str]:
+            try:
+                hotels = scrape_city_hotels(s, city.get("url", ""))
+            except Exception:
+                hotels = []
+            c = dict(city)
+            c["hotels"] = hotels
+            return c
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=poolsize) as pool:
+            futures = [pool.submit(job, c) for c in cities]
+            for fut in as_completed(futures):
+                updated_cities.append(fut.result())
+    else:
+        updated_cities = cities
+
+    return url, {"cities": updated_cities, "popular_regions": popular_regions}
+
 
 # ---------- Main ----------
 
